@@ -16,7 +16,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { Bot, GrammyError, InputFile, type Context } from 'grammy'
-import type { ReactionTypeEmoji } from 'grammy/types'
+import type { ReactionTypeEmoji, MessageEntity } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
@@ -749,6 +749,38 @@ function safeName(s: string | undefined): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Entity formatting — converts Telegram message entities to markdown so
+// formatting (bold, italic, blockquote, code, links) is preserved for Claude.
+// Telegram uses UTF-16 code unit offsets; we work with the raw JS string which
+// is also UTF-16, so slice() is correct here.
+// ---------------------------------------------------------------------------
+function applyEntities(text: string, entities: MessageEntity[] | undefined): string {
+  if (!entities || entities.length === 0) return text
+  // Process from end → start so earlier offsets stay valid after insertions
+  const sorted = [...entities].sort((a, b) => (b.offset - a.offset) || (b.length - a.length))
+  let result = text
+  for (const entity of sorted) {
+    const before = result.slice(0, entity.offset)
+    const inner  = result.slice(entity.offset, entity.offset + entity.length)
+    const after  = result.slice(entity.offset + entity.length)
+    switch (entity.type) {
+      case 'bold':              result = `${before}**${inner}**${after}`; break
+      case 'italic':            result = `${before}_${inner}_${after}`; break
+      case 'code':              result = `${before}\`${inner}\`${after}`; break
+      case 'pre':               result = `${before}\`\`\`\n${inner}\n\`\`\`${after}`; break
+      case 'strikethrough':     result = `${before}~~${inner}~~${after}`; break
+      case 'blockquote':
+      case 'expandable_blockquote':
+        result = `${before}> ${inner.replace(/\n/g, '\n> ')}${after}`; break
+      case 'text_link':
+        result = `${before}[${inner}](${entity.url})${after}`; break
+      default: break
+    }
+  }
+  return result
+}
+
+// ---------------------------------------------------------------------------
 // Message batching — collects messages arriving within BATCH_WINDOW_MS into a
 // single Claude turn. Primary use-case: forwarded message + user comment sent
 // as two rapid Telegram messages.
@@ -761,7 +793,8 @@ type BatchEntry = {
   attachment: AttachmentMeta | undefined
   message_id: string | undefined
   ts: string
-  forwardFrom: string | undefined  // original sender if forwarded
+  forwardFrom: string | undefined   // original sender if forwarded
+  forwardDate: string | undefined   // original message timestamp if forwarded
 }
 
 type BatchBuffer = {
@@ -791,11 +824,20 @@ function flushBatch(chat_id: string): void {
     ? entries[0]!.text  // single message — no decoration
     : entries.map(e => {
         const time = new Date(e.ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' })
-        const header = e.forwardFrom ? `[forwarded from ${e.forwardFrom}, ${time}]` : `[${time}]`
+        let header: string
+        if (e.forwardFrom) {
+          const fwdTime = e.forwardDate
+            ? new Date(e.forwardDate).toLocaleString('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+            : time
+          header = `[forwarded from ${e.forwardFrom}, originally ${fwdTime}, received ${time}]`
+        } else {
+          header = `[${time}]`
+        }
         const parts = [header]
         if (e.text) parts.push(e.text)
-        if (e.imagePath) parts.push(`(фото: ${e.imagePath})`)
-        if (e.attachment) parts.push(`(файл: ${e.attachment.name ?? e.attachment.kind})`)
+        // Include image path so Claude can Read it
+        if (e.imagePath) parts.push(`[image: ${e.imagePath}]`)
+        if (e.attachment) parts.push(`[attachment: ${e.attachment.name ?? e.attachment.kind}, id: ${e.attachment.file_id}]`)
         return parts.join('\n')
       }).join('\n---\n')
 
@@ -866,10 +908,16 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // Extract forward origin if this message was forwarded
+  // Apply Telegram formatting entities to preserve bold/italic/code/blockquote/links
+  const entities = ctx.message?.entities ?? ctx.message?.caption_entities
+  const formattedText = applyEntities(text, entities)
+
+  // Extract forward origin and original date if this message was forwarded
   const fwdOrigin = ctx.message?.forward_origin
   let forwardFrom: string | undefined
+  let forwardDate: string | undefined
   if (fwdOrigin) {
+    forwardDate = new Date(fwdOrigin.date * 1000).toISOString()
     if (fwdOrigin.type === 'user') {
       forwardFrom = fwdOrigin.sender_user.username
         ? `@${fwdOrigin.sender_user.username}`
@@ -888,12 +936,13 @@ async function handleInbound(
   }
 
   const entry: BatchEntry = {
-    text,
+    text: formattedText,
     imagePath,
     attachment,
     message_id: msgId != null ? String(msgId) : undefined,
     ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
     forwardFrom,
+    forwardDate,
   }
 
   const existing = batchBuffers.get(chat_id)
