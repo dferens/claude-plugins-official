@@ -761,6 +761,7 @@ type BatchEntry = {
   attachment: AttachmentMeta | undefined
   message_id: string | undefined
   ts: string
+  forwardFrom: string | undefined  // original sender if forwarded
 }
 
 type BatchBuffer = {
@@ -781,13 +782,22 @@ function flushBatch(chat_id: string): void {
 
   const { entries, user, user_id, access } = buf
 
-  // Combine all text parts, skipping blanks between them
-  const combinedText = entries.map(e => e.text).filter(Boolean).join('\n')
-
-  // Use the first message_id and ts; pick the first image and attachment found
+  // Format each entry with a header, then join with separator
   const first = entries[0]!
   const imagePath = entries.find(e => e.imagePath)?.imagePath
   const attachment = entries.find(e => e.attachment)?.attachment
+
+  const combinedText = entries.length === 1
+    ? entries[0]!.text  // single message — no decoration
+    : entries.map(e => {
+        const time = new Date(e.ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' })
+        const header = e.forwardFrom ? `[↩ ${e.forwardFrom}, ${time}]` : `[${time}]`
+        const parts = [header]
+        if (e.text) parts.push(e.text)
+        if (e.imagePath) parts.push(`(фото: ${e.imagePath})`)
+        if (e.attachment) parts.push(`(файл: ${e.attachment.name ?? e.attachment.kind})`)
+        return parts.join('\n')
+      }).join('\n---\n')
 
   mcp.notification({
     method: 'notifications/claude/channel',
@@ -856,12 +866,34 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // Extract forward origin if this message was forwarded
+  const fwdOrigin = ctx.message?.forward_origin
+  let forwardFrom: string | undefined
+  if (fwdOrigin) {
+    if (fwdOrigin.type === 'user') {
+      forwardFrom = fwdOrigin.sender_user.username
+        ? `@${fwdOrigin.sender_user.username}`
+        : fwdOrigin.sender_user.first_name
+    } else if (fwdOrigin.type === 'channel') {
+      forwardFrom = fwdOrigin.chat.username
+        ? `@${fwdOrigin.chat.username}`
+        : fwdOrigin.chat.title
+    } else if (fwdOrigin.type === 'chat') {
+      forwardFrom = fwdOrigin.sender_chat.username
+        ? `@${fwdOrigin.sender_chat.username}`
+        : fwdOrigin.sender_chat.title
+    } else if (fwdOrigin.type === 'hidden_user') {
+      forwardFrom = fwdOrigin.sender_user_name
+    }
+  }
+
   const entry: BatchEntry = {
     text,
     imagePath,
     attachment,
     message_id: msgId != null ? String(msgId) : undefined,
     ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    forwardFrom,
   }
 
   const existing = batchBuffers.get(chat_id)
