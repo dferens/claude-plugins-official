@@ -791,7 +791,7 @@ function flushBatch(chat_id: string): void {
     ? entries[0]!.text  // single message — no decoration
     : entries.map(e => {
         const time = new Date(e.ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' })
-        const header = e.forwardFrom ? `[↩ ${e.forwardFrom}, ${time}]` : `[${time}]`
+        const header = e.forwardFrom ? `[forwarded from ${e.forwardFrom}, ${time}]` : `[${time}]`
         const parts = [header]
         if (e.text) parts.push(e.text)
         if (e.imagePath) parts.push(`(фото: ${e.imagePath})`)
