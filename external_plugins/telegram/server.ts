@@ -753,7 +753,7 @@ function safeName(s: string | undefined): string | undefined {
 // single Claude turn. Primary use-case: forwarded message + user comment sent
 // as two rapid Telegram messages.
 // ---------------------------------------------------------------------------
-const BATCH_WINDOW_MS = 300
+const BATCH_WINDOW_MS = 1500
 
 type BatchEntry = {
   text: string
