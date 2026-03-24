@@ -16,7 +16,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { Bot, GrammyError, InputFile, type Context } from 'grammy'
-import type { ReactionTypeEmoji } from 'grammy/types'
+import type { ReactionTypeEmoji, MessageEntity } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
@@ -635,6 +635,44 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
+// Bot commands — intercepted before forwarding to Claude Code.
+// These act directly on the Claude Code process via signals to process.ppid.
+bot.on('message:entities:bot_command', async ctx => {
+  const result = gate(ctx)
+  if (result.action === 'drop') return
+  if (result.action === 'pair') {
+    await ctx.reply(`Pairing required — run in Claude Code:\n\n/telegram:access pair ${result.code}`)
+    return
+  }
+
+  const text = ctx.message.text ?? ''
+  const command = text.split(' ')[0].split('@')[0].toLowerCase()
+
+  if (command === '/abort') {
+    await ctx.reply('⚡ Перериваю...')
+    process.kill(process.ppid, 'SIGINT')
+    return
+  }
+
+  if (command === '/restart') {
+    await ctx.reply('🔄 Перезапускаюсь...')
+    setTimeout(() => process.kill(process.ppid, 'SIGTERM'), 500)
+    return
+  }
+
+  if (command === '/shutdown') {
+    await ctx.reply('🔴 Вимикаюсь...')
+    // Create flag so claudetg loop exits without restarting
+    const { writeFileSync } = await import('fs')
+    writeFileSync('/tmp/claudetg_no_restart', '')
+    setTimeout(() => process.kill(process.ppid, 'SIGTERM'), 500)
+    return
+  }
+
+  // Unknown command — forward to Claude Code as regular message
+  await handleInbound(ctx, text, undefined)
+})
+
 bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
@@ -748,6 +786,127 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// ---------------------------------------------------------------------------
+// Entity formatting — converts Telegram message entities to markdown so
+// formatting (bold, italic, blockquote, code, links) is preserved for Claude.
+// Telegram uses UTF-16 code unit offsets; we work with the raw JS string which
+// is also UTF-16, so slice() is correct here.
+// ---------------------------------------------------------------------------
+function applyEntities(text: string, entities: MessageEntity[] | undefined): string {
+  if (!entities || entities.length === 0) return text
+  // Process from end → start so earlier offsets stay valid after insertions
+  const sorted = [...entities].sort((a, b) => (b.offset - a.offset) || (b.length - a.length))
+  let result = text
+  for (const entity of sorted) {
+    const before = result.slice(0, entity.offset)
+    const inner  = result.slice(entity.offset, entity.offset + entity.length)
+    const after  = result.slice(entity.offset + entity.length)
+    switch (entity.type) {
+      case 'bold':              result = `${before}**${inner}**${after}`; break
+      case 'italic':            result = `${before}_${inner}_${after}`; break
+      case 'code':              result = `${before}\`${inner}\`${after}`; break
+      case 'pre':               result = `${before}\`\`\`\n${inner}\n\`\`\`${after}`; break
+      case 'strikethrough':     result = `${before}~~${inner}~~${after}`; break
+      case 'blockquote':
+      case 'expandable_blockquote':
+        result = `${before}> ${inner.replace(/\n/g, '\n> ')}${after}`; break
+      case 'text_link':
+        result = `${before}[${inner}](${entity.url})${after}`; break
+      default: break
+    }
+  }
+  return result
+}
+
+// ---------------------------------------------------------------------------
+// Message batching — collects messages arriving within BATCH_WINDOW_MS into a
+// single Claude turn. Primary use-case: forwarded message + user comment sent
+// as two rapid Telegram messages.
+// ---------------------------------------------------------------------------
+const BATCH_WINDOW_MS = 1500
+
+type BatchEntry = {
+  text: string
+  imagePath: string | undefined
+  attachment: AttachmentMeta | undefined
+  message_id: string | undefined
+  ts: string
+  forwardFrom: string | undefined   // original sender if forwarded
+  forwardDate: string | undefined   // original message timestamp if forwarded
+}
+
+type BatchBuffer = {
+  entries: BatchEntry[]
+  timer: ReturnType<typeof setTimeout>
+  chat_id: string
+  user: string
+  user_id: string
+  access: Access
+}
+
+const batchBuffers = new Map<string, BatchBuffer>()
+
+function flushBatch(chat_id: string): void {
+  const buf = batchBuffers.get(chat_id)
+  if (!buf) return
+  batchBuffers.delete(chat_id)
+
+  const { entries, user, user_id, access } = buf
+
+  // Format each entry with a header, then join with separator
+  const first = entries[0]!
+  const imagePath = entries.find(e => e.imagePath)?.imagePath
+  const attachment = entries.find(e => e.attachment)?.attachment
+
+  const combinedText = entries.length === 1
+    ? entries[0]!.text  // single message — no decoration
+    : entries.map(e => {
+        const time = new Date(e.ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' })
+        let header: string
+        if (e.forwardFrom) {
+          const fwdTime = e.forwardDate
+            ? new Date(e.forwardDate).toLocaleString('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+            : time
+          header = `[forwarded from ${e.forwardFrom}, originally ${fwdTime}, received ${time}]`
+        } else {
+          header = `[${time}]`
+        }
+        const parts = [header]
+        if (e.text) parts.push(e.text)
+        // Include image path so Claude can Read it
+        if (e.imagePath) parts.push(`[image: ${e.imagePath}]`)
+        if (e.attachment) parts.push(`[attachment: ${e.attachment.name ?? e.attachment.kind}, id: ${e.attachment.file_id}]`)
+        return parts.join('\n')
+      }).join('\n---\n')
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: combinedText,
+      meta: {
+        chat_id,
+        ...(first.message_id != null ? { message_id: first.message_id } : {}),
+        user,
+        user_id,
+        ts: first.ts,
+        ...(imagePath ? { image_path: imagePath } : {}),
+        ...(attachment ? {
+          attachment_kind: attachment.kind,
+          attachment_file_id: attachment.file_id,
+          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+          ...(attachment.name ? { attachment_name: attachment.name } : {}),
+        } : {}),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+  })
+
+  // Re-send typing indicator so Claude's processing phase looks live
+  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -787,31 +946,59 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // image_path goes in meta only — an in-content "[image attached — read: PATH]"
-  // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
-    },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  // Apply Telegram formatting entities to preserve bold/italic/code/blockquote/links
+  const entities = ctx.message?.entities ?? ctx.message?.caption_entities
+  const formattedText = applyEntities(text, entities)
+
+  // Extract forward origin and original date if this message was forwarded
+  const fwdOrigin = ctx.message?.forward_origin
+  let forwardFrom: string | undefined
+  let forwardDate: string | undefined
+  if (fwdOrigin) {
+    forwardDate = new Date(fwdOrigin.date * 1000).toISOString()
+    if (fwdOrigin.type === 'user') {
+      forwardFrom = fwdOrigin.sender_user.username
+        ? `@${fwdOrigin.sender_user.username}`
+        : fwdOrigin.sender_user.first_name
+    } else if (fwdOrigin.type === 'channel') {
+      forwardFrom = fwdOrigin.chat.username
+        ? `@${fwdOrigin.chat.username}`
+        : fwdOrigin.chat.title
+    } else if (fwdOrigin.type === 'chat') {
+      forwardFrom = fwdOrigin.sender_chat.username
+        ? `@${fwdOrigin.sender_chat.username}`
+        : fwdOrigin.sender_chat.title
+    } else if (fwdOrigin.type === 'hidden_user') {
+      forwardFrom = fwdOrigin.sender_user_name
+    }
+  }
+
+  const entry: BatchEntry = {
+    text: formattedText,
+    imagePath,
+    attachment,
+    message_id: msgId != null ? String(msgId) : undefined,
+    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    forwardFrom,
+    forwardDate,
+  }
+
+  const existing = batchBuffers.get(chat_id)
+  if (existing) {
+    // Another message is already buffered — add to it and let the timer fire
+    existing.entries.push(entry)
+  } else {
+    // First message for this chat in this window — start the batch timer
+    const timer = setTimeout(() => flushBatch(chat_id), BATCH_WINDOW_MS)
+    batchBuffers.set(chat_id, {
+      entries: [entry],
+      timer,
+      chat_id,
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      access,
+    })
+  }
 }
 
 // Without this, any throw in a message handler stops polling permanently
@@ -835,6 +1022,9 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              { command: 'abort', description: 'Перервати поточне завдання (Ctrl+C)' },
+              { command: 'restart', description: 'Перезапустити Claude Code' },
+              { command: 'shutdown', description: 'Вимкнути Claude Code' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
