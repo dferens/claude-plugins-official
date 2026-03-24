@@ -1013,6 +1013,8 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              { command: 'abort', description: 'Перервати поточне завдання (Ctrl+C)' },
+              { command: 'shutdown', description: 'Вимкнути Claude Code' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
