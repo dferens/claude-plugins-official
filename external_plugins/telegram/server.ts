@@ -635,6 +635,35 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
+// Bot commands — intercepted before forwarding to Claude Code.
+// These act directly on the Claude Code process via signals to process.ppid.
+bot.on('message:entities:bot_command', async ctx => {
+  const result = gate(ctx)
+  if (result.action === 'drop') return
+  if (result.action === 'pair') {
+    await ctx.reply(`Pairing required — run in Claude Code:\n\n/telegram:access pair ${result.code}`)
+    return
+  }
+
+  const text = ctx.message.text ?? ''
+  const command = text.split(' ')[0].split('@')[0].toLowerCase()
+
+  if (command === '/abort') {
+    await ctx.reply('⚡ Перериваю...')
+    process.kill(process.ppid, 'SIGINT')
+    return
+  }
+
+  if (command === '/shutdown') {
+    await ctx.reply('🔴 Вимикаюсь...')
+    setTimeout(() => process.kill(process.ppid, 'SIGTERM'), 500)
+    return
+  }
+
+  // Unknown command — forward to Claude Code as regular message
+  await handleInbound(ctx, text, undefined)
+})
+
 bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
