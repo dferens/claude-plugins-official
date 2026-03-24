@@ -654,8 +654,17 @@ bot.on('message:entities:bot_command', async ctx => {
     return
   }
 
+  if (command === '/restart') {
+    await ctx.reply('🔄 Перезапускаюсь...')
+    setTimeout(() => process.kill(process.ppid, 'SIGTERM'), 500)
+    return
+  }
+
   if (command === '/shutdown') {
     await ctx.reply('🔴 Вимикаюсь...')
+    // Create flag so claudetg loop exits without restarting
+    const { writeFileSync } = await import('fs')
+    writeFileSync('/tmp/claudetg_no_restart', '')
     setTimeout(() => process.kill(process.ppid, 'SIGTERM'), 500)
     return
   }
@@ -1014,6 +1023,7 @@ void (async () => {
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
               { command: 'abort', description: 'Перервати поточне завдання (Ctrl+C)' },
+              { command: 'restart', description: 'Перезапустити Claude Code' },
               { command: 'shutdown', description: 'Вимкнути Claude Code' },
             ],
             { scope: { type: 'all_private_chats' } },
